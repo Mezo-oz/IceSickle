@@ -169,10 +169,10 @@ an always-on duty cycle and destroying the power budget. The Brief 3 scaffold
 reads the pin before consuming it as a wake source and warns. No further action
 unless bench testing shows the warning is insufficient.
 
-## The DS3231 is half-built
+## The DS3231: codec and transport done, wiring next
 
 D13 confirmed the clock as intended hardware and left "no I2C driver exists" as
-real work. Half of it now does.
+real work. It exists now.
 
 **Done:** `crates/icesickle-core/src/clock.rs` — the register codec. Registers
 `0x00`–`0x06` and the status byte in, Unix milliseconds out, with the reads that
@@ -182,19 +182,36 @@ reading `0xFF`, a chip left in 12-hour mode, and impossible dates including the
 2100-02-29 the DS3231's own leap-year rule will eventually produce. Host-tested
 on stable, no hardware, following the same seam as `button` and `cooldown`.
 
+**Also done:** the transport, split the way
+[issue #24](https://github.com/Mezo-oz/IceSickle/issues/24) settled it. The
+`RegisterBus` trait, `read_clock` and `set_clock` are in the core crate;
+`firmware/nostd/src/clock.rs` is a ~12-line implementation that forwards bytes
+and decides nothing.
+
+The split was chosen over a CI source guard for a reason that only turned up
+while sizing it: **it moves the ordering rules into reach of a host test.** The
+stop flag must be read before the time registers mean anything, and the clock
+must be set before that flag is acknowledged — and a driver holding those rules
+holds them where nothing can check them, since `firmware/nostd` can host no
+tests at all. A mock bus now covers both on stable. That was worth more than the
+register ban the trait was designed around.
+
 **Not done, in order:**
 
-1. **The I2C transport.** esp-hal's `I2c` driver, two transactions — write the
-   register pointer, read seven bytes — plus the status read and the two writes
-   that set the clock. This is the part CI can only compile.
-2. **Wiring it into the firmware.** `firmware/nostd/src/bin/main.rs:62` still
+1. **Wiring it into the firmware.** `firmware/nostd/src/bin/main.rs:62` still
    defines `now_ms()` as `Instant::now()`, and line 156 still prints
    `"ms since boot"`. Until that changes the firmware cannot produce the Unix
    `timestamp_ms` that D13 made mandatory and that `TOKEN_PROTOCOL.md` §5,
    `VERIFIER_MODEL.md` §1 and `AttestationPayload` already document — **the
    docs and the code currently disagree on main, and the §6 step 8 arrival
    check is unimplementable until they stop.**
-3. **Cooldown persistence**, below, which needs a time base that survives the
+
+   Two things the wiring has to answer that the transport did not: which GPIOs
+   carry SDA and SCL (a board fact, currently written down nowhere), and what a
+   device does when the clock is absent or its cell is dead. The second is not a
+   detail — **QEMU models no DS3231**, so whatever the firmware does on a failed
+   read is what the emulator job will exercise on every run.
+2. **Cooldown persistence**, below, which needs a time base that survives the
    reset and now has one.
 
 **A rule the hardware does not enforce, so the code does.** D13 says the clock
@@ -214,12 +231,15 @@ rather than simply not noticing the rule.
 
 Two limits worth keeping in view:
 
-- **This does not stop raw I2C.** Firmware can still hand a bus driver its own
-  byte slice, and no type in a host crate can prevent that. What the type buys
-  is that the sanctioned path is the path of least resistance and that leaving
-  it looks deliberate. **When the driver lands, its write path should take a
-  `RegisterWrite` rather than a `(register, bytes)` pair** — that is where this
-  constraint either holds or quietly stops mattering.
+- **This does not stop raw I2C.** Firmware can still drive the bus directly, and
+  no type in a host crate can prevent that. The driver's write path does take a
+  `RegisterWrite` rather than a `(register, bytes)` pair, so the seam the ban
+  could have leaked through is closed; what remains is that `Ds3231::new`
+  **consumes** the `I2c` peripheral, so no raw handle survives elsewhere and the
+  only code that can reach the part is two method bodies. That is a surface
+  small enough to read, not a proof. **Any future change that hands the
+  peripheral out again reopens this**, and #24 records it as an acceptance
+  criterion rather than a preference.
 - **Do not substitute a DS3234.** The SPI sibling of this part carries 256 bytes
   of battery-backed SRAM, which would turn a rule that is currently easy to keep
   into one that is easy to break.

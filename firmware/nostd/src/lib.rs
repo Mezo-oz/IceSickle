@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod button;
+pub mod clock;
 pub mod entropy;
 
 // Attestation logic, the debounce state machine and the cooldown all live in

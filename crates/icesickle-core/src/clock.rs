@@ -548,6 +548,109 @@ const fn days_from_civil(year: u16, month: u8, day: u8) -> i64 {
     era as i64 * 146_097 + day_of_era as i64 - 719_468
 }
 
+// ---------------------------------------------------------------------------
+// The transport seam
+// ---------------------------------------------------------------------------
+
+/// Everything the firmware must supply to talk to the clock, and nothing more.
+///
+/// # Why the seam is here and not in the firmware
+///
+/// [`RegisterWrite`] makes a write to [`SCRATCHPAD_REGISTERS`] unrepresentable,
+/// but a type only guards the code that has to go through it. A driver whose
+/// write path took `(register, bytes)` — the obvious signature, and the one
+/// anyone reaches for — would open a second route to the register file that the
+/// type never sees. Nothing would fail: the codec would still refuse, the tests
+/// would still pass, and the ban would quietly be a doc comment again.
+///
+/// So the driver does not get to name a register. `write` takes a
+/// [`RegisterWrite`], which has private fields and no public constructor, so an
+/// implementation of this trait **cannot express a forbidden write even inside
+/// its own body**. The register byte does cross the boundary, but sealed inside
+/// a value only this module can build.
+///
+/// `read` does take a register, and that asymmetry is the point rather than an
+/// oversight: a read cannot store an identifier, so reads are not what D13's
+/// rule is about. Constraining them would defend nothing and cost a trait
+/// method per register.
+///
+/// # What it still does not close
+///
+/// Firmware owns the I2C peripheral and can always bypass this trait by driving
+/// the bus directly. No type in a platform-independent crate can prevent that.
+/// The mitigation is ownership, not typing: the implementor should *consume*
+/// the peripheral, so no raw handle survives elsewhere and the only code that
+/// can reach the bus is the handful of lines implementing these two methods.
+pub trait RegisterBus {
+    /// However the bus driver fails. `esp_hal::i2c::master::Error` on hardware.
+    type Error;
+
+    /// Push a sanctioned write: send [`RegisterWrite::bytes`] to
+    /// [`I2C_ADDRESS`]. Implementations forward bytes and decide nothing.
+    fn write(&mut self, write: &RegisterWrite) -> Result<(), Self::Error>;
+
+    /// Set the register pointer to `register`, then read `out.len()` bytes.
+    fn read(&mut self, register: u8, out: &mut [u8]) -> Result<(), Self::Error>;
+}
+
+/// Reading the clock failed on the bus, or in the bytes the bus returned.
+///
+/// Kept as two variants because they call for different responses and are
+/// genuinely different events. A [`ReadError::Bus`] means the transaction did
+/// not happen — the part did not acknowledge, the bus timed out — and retrying
+/// is reasonable. A [`ReadError::Clock`] means the transaction succeeded
+/// perfectly and the bytes must not be believed; retrying returns the same
+/// answer, because a dead coin cell does not heal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError<E> {
+    /// The I2C transaction itself failed.
+    Bus(E),
+    /// The bytes came back and could not be trusted. See [`ClockError`].
+    Clock(ClockError),
+}
+
+/// The whole read: status, then the time registers, then Unix milliseconds.
+///
+/// The order is the reason this lives here rather than in the driver. The stop
+/// flag is what decides whether the time registers mean anything, so it must be
+/// read first — and "must be read first" in a driver is a comment somebody
+/// follows, while here it is simply not the caller's to get wrong. Firmware
+/// cannot skip the check, because firmware does not own the sequence.
+///
+/// Two transactions rather than one nine-byte read: the status register is at
+/// `0x0F`, past `0x07`–`0x0D`, and a single sweep across the range would pull
+/// the alarm registers into a buffer for no reason. Reading them is harmless —
+/// reads are not what the ban is about — but not reading them at all is one
+/// less place a future refactor can find a use for the bytes.
+pub fn read_clock<B: RegisterBus>(bus: &mut B) -> Result<u64, ReadError<B::Error>> {
+    let mut status = [0u8; 1];
+    bus.read(REG_STATUS, &mut status).map_err(ReadError::Bus)?;
+
+    let mut registers = [0u8; TIME_REGISTER_COUNT];
+    bus.read(REG_SECONDS, &mut registers)
+        .map_err(ReadError::Bus)?;
+
+    read_unix_ms(status[0], &registers).map_err(ReadError::Clock)
+}
+
+/// Set the clock and then acknowledge the stop flag, in that order.
+///
+/// The order is load-bearing and is not the caller's to choose. The stop flag
+/// is the only durable record that the time registers are stale; clearing it
+/// before a real time is written converts a detectable fault into a
+/// confidently wrong date, with nothing left to say otherwise.
+///
+/// The status byte is read here rather than passed in, for the same reason.
+/// A caller supplying it could supply a stale one, and the acknowledgement is a
+/// read-modify-write — the low bits carry the 32 kHz enable and the alarm
+/// flags, so a blind write would silently reconfigure the part.
+pub fn set_clock<B: RegisterBus>(bus: &mut B, time: &CivilTime) -> Result<(), B::Error> {
+    let mut status = [0u8; 1];
+    bus.read(REG_STATUS, &mut status)?;
+
+    bus.write(&RegisterWrite::set_time(time))?;
+    bus.write(&RegisterWrite::acknowledge_oscillator_stop(status[0]))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,5 +1063,188 @@ mod tests {
             assert_eq!(write.payload(), &[status & 0x7F], "status {status:#04x}");
             assert!(!oscillator_stopped(write.payload()[0]));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The transport seam
+    // -----------------------------------------------------------------------
+
+    /// Stands in the firmware's position. Everything it does is what the real
+    /// esp-hal wrapper does: forward bytes, record nothing, decide nothing.
+    ///
+    /// This mock is the entire reason the sequencing below is testable at all.
+    /// `firmware/nostd` can host no tests — `--all-targets` needs the `test`
+    /// crate and a `#[panic_handler]` a `no_std` binary cannot provide, which is
+    /// why CI builds it `--lib --bins` — so any ordering rule that lived in the
+    /// driver would be verified by nothing. Moving the sequence into this crate
+    /// is what moves it into reach of a host test on stable.
+    #[derive(Default)]
+    struct MockBus {
+        /// Every write, in order, as (register, payload).
+        writes: heapless::Vec<(u8, heapless::Vec<u8, 8>), 4>,
+        /// Registers the part will report.
+        status: u8,
+        registers: [u8; TIME_REGISTER_COUNT],
+        /// Reads seen, in order, so ordering can be asserted.
+        reads: heapless::Vec<u8, 4>,
+        /// When set, every operation fails instead.
+        fail: bool,
+    }
+
+    impl MockBus {
+        fn holding(registers: [u8; TIME_REGISTER_COUNT], status: u8) -> Self {
+            Self {
+                registers,
+                status,
+                ..Default::default()
+            }
+        }
+    }
+
+    impl RegisterBus for MockBus {
+        type Error = ();
+
+        fn write(&mut self, write: &RegisterWrite) -> Result<(), Self::Error> {
+            if self.fail {
+                return Err(());
+            }
+            let mut payload = heapless::Vec::new();
+            payload.extend_from_slice(write.payload()).unwrap();
+            self.writes.push((write.register(), payload)).unwrap();
+            Ok(())
+        }
+
+        fn read(&mut self, register: u8, out: &mut [u8]) -> Result<(), Self::Error> {
+            if self.fail {
+                return Err(());
+            }
+            let _ = self.reads.push(register);
+            match register {
+                REG_STATUS => out[0] = self.status,
+                REG_SECONDS => out.copy_from_slice(&self.registers),
+                other => panic!("read of unexpected register {other:#04x}"),
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_firmware_shaped_implementation_drives_the_whole_read() {
+        let mut bus = MockBus::holding(KNOWN_REGS, 0x00);
+        assert_eq!(read_clock(&mut bus), Ok(KNOWN_UNIX_MS));
+    }
+
+    /// Status is read before the time registers, because it is what decides
+    /// whether they mean anything.
+    ///
+    /// Asserted on the transaction order rather than only on the result, so the
+    /// test still fails if someone reorders the reads in a way that happens to
+    /// produce the right answer for a healthy part.
+    #[test]
+    fn the_stop_flag_is_read_before_the_time_registers() {
+        let mut bus = MockBus::holding(KNOWN_REGS, 0x00);
+        read_clock(&mut bus).unwrap();
+        assert_eq!(
+            bus.reads.as_slice(),
+            &[REG_STATUS, REG_SECONDS],
+            "the status check must come first, and must not be skipped",
+        );
+    }
+
+    /// Firmware cannot skip the stop-flag check, because firmware does not own
+    /// the sequence. Under a driver that exposed raw reads, this rule would be
+    /// a comment.
+    #[test]
+    fn core_owns_the_stop_flag_check_so_a_driver_cannot_skip_it() {
+        let mut bus = MockBus::holding(KNOWN_REGS, OSCILLATOR_STOP_FLAG);
+        assert_eq!(
+            read_clock(&mut bus),
+            Err(ReadError::Clock(ClockError::OscillatorStopped)),
+            "well-formed registers behind a raised stop flag must not be believed",
+        );
+    }
+
+    /// A bus failure and an untrustworthy reading are different events and must
+    /// not collapse into one.
+    #[test]
+    fn a_bus_failure_is_distinguishable_from_an_unbelievable_reading() {
+        let mut bus = MockBus {
+            fail: true,
+            ..MockBus::holding(KNOWN_REGS, 0x00)
+        };
+        assert_eq!(read_clock(&mut bus), Err(ReadError::Bus(())));
+
+        let mut junk = MockBus::holding([0xFF; TIME_REGISTER_COUNT], 0x00);
+        assert!(matches!(read_clock(&mut junk), Err(ReadError::Clock(_))));
+    }
+
+    /// The time is written before the flag is acknowledged, and never after.
+    ///
+    /// Getting this backwards clears the only durable record that the registers
+    /// were stale while they are still stale — a detectable fault becomes a
+    /// confidently wrong date. It is the single most consequential ordering rule
+    /// in the module, and it is now not a caller's to get wrong.
+    #[test]
+    fn the_clock_is_set_before_the_stop_flag_is_acknowledged() {
+        let mut bus = MockBus::holding(KNOWN_REGS, 0x8B);
+        let time = CivilTime::new(2026, 8, 27, 14, 5, 9).unwrap();
+        set_clock(&mut bus, &time).unwrap();
+
+        assert_eq!(bus.writes.len(), 2, "exactly two writes");
+        assert_eq!(bus.writes[0].0, REG_SECONDS, "the time is written first");
+        assert_eq!(
+            bus.writes[1].0, REG_STATUS,
+            "the acknowledgement comes second",
+        );
+        assert_eq!(bus.writes[0].1, KNOWN_REGS, "the encoded time");
+        assert_eq!(
+            bus.writes[1].1.as_slice(),
+            &[0x0B],
+            "the stop bit cleared, the 32 kHz enable and alarm flags preserved",
+        );
+    }
+
+    /// The status byte the acknowledgement preserves is read here, not supplied
+    /// by a caller who might hand over a stale one.
+    #[test]
+    fn set_clock_reads_the_status_it_is_about_to_preserve() {
+        let mut bus = MockBus::holding(KNOWN_REGS, 0x88);
+        set_clock(&mut bus, &CivilTime::new(2026, 8, 27, 14, 5, 9).unwrap()).unwrap();
+        assert_eq!(bus.reads.as_slice(), &[REG_STATUS]);
+        assert_eq!(bus.writes[1].1.as_slice(), &[0x08]);
+    }
+
+    /// The seam itself: nothing that reached the mock could have named a banned
+    /// register, because nothing outside this module chose one.
+    #[test]
+    fn no_write_reaching_the_bus_targets_the_scratchpad() {
+        let mut bus = MockBus::holding(KNOWN_REGS, 0xFF);
+        set_clock(&mut bus, &CivilTime::new(2026, 8, 27, 14, 5, 9).unwrap()).unwrap();
+
+        assert!(!bus.writes.is_empty(), "the check must see traffic");
+        for (register, _) in &bus.writes {
+            assert!(
+                !is_scratchpad_register(*register),
+                "a write reached the bus at {register:#04x}",
+            );
+        }
+    }
+
+    /// A full turn of the crank: set a clock, read back what the part would now
+    /// hold, and get the instant that went in.
+    #[test]
+    fn a_clock_that_was_set_reads_back_as_the_time_it_was_set_to() {
+        let time = CivilTime::new(2026, 8, 27, 14, 5, 9).unwrap();
+
+        let mut bus = MockBus::holding([0x00; TIME_REGISTER_COUNT], OSCILLATOR_STOP_FLAG);
+        set_clock(&mut bus, &time).unwrap();
+
+        // What the part would hold afterwards: the written time, and a status
+        // whose stop flag the acknowledgement cleared.
+        let mut written = [0u8; TIME_REGISTER_COUNT];
+        written.copy_from_slice(&bus.writes[0].1);
+        let mut settled = MockBus::holding(written, bus.writes[1].1[0]);
+
+        assert_eq!(read_clock(&mut settled), Ok(time.unix_ms()));
     }
 }
