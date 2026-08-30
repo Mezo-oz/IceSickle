@@ -180,6 +180,13 @@ mod tests {
 
     /// Build a log that looks like real firmware output, signed for real.
     /// Fixed seed, so this is deterministic.
+    ///
+    /// `parse_log` never reads the timestamp line — only `payload:`, `pubkey:`
+    /// and `signature:` — so the clock line here is decoration and no test
+    /// depends on its shape. It is kept matching the firmware anyway: a fixture
+    /// that has quietly stopped resembling the thing it imitates is worth less
+    /// with every release, and this one said "ms since boot" for three decisions
+    /// after that stopped being true.
     fn good_log() -> String {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut payload = [0u8; ATTESTATION_PAYLOAD_LEN];
@@ -192,7 +199,8 @@ mod tests {
              INFO - gate open: true entropy available\n\
              INFO - === ATTESTATION ===\n\
              INFO - event:     ButtonPress {{ gpio: 0 }}\n\
-             INFO - timestamp: 12 ms since boot\n\
+             INFO - clock: OK   2026-08-27T14:05:09Z (1787839509000 ms)\n\
+             INFO - timestamp: 1787839509000 (Unix ms)\n\
              INFO - payload:   {}\n\
              INFO - pubkey:    {}\n\
              INFO - signature: {}\n",

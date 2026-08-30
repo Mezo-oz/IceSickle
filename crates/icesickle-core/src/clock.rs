@@ -182,6 +182,134 @@ pub enum ClockError {
     TwelveHourMode,
 }
 
+/// Every variant, in discriminant order. See `causes_are_pairwise_distinct` and
+/// `every_cause_is_listed` for what this exists to make checkable.
+///
+/// The register numbers are the ones each check actually reports, so a value
+/// here is a realistic instance rather than a placeholder.
+///
+/// `#[cfg(test)]` because nothing in the firmware iterates the variants — only
+/// the tests do. It is kept here beside the enum rather than moved into the test
+/// module so that whoever adds a variant reads it while adding one; the
+/// enforcement is unaffected either way, and the two halves land at different
+/// times. `cause` and `remedy` are exhaustive matches in ordinary code, so a new
+/// variant fails an ordinary build; this array and `clock_error_index` then fail
+/// `cargo test` until the variant is listed too.
+#[cfg(test)]
+const ALL_CLOCK_ERRORS: [ClockError; 5] = [
+    ClockError::OscillatorStopped,
+    ClockError::NotBcd { register: 0x00 },
+    ClockError::ReservedBitSet { register: 0x00 },
+    ClockError::OutOfRange { register: 0x05 },
+    ClockError::TwelveHourMode,
+];
+
+/// Position in [`ALL_CLOCK_ERRORS`], and the reason adding a variant cannot go
+/// unnoticed.
+///
+/// The match is exhaustive with no wildcard arm, so a new variant stops this
+/// compiling until someone gives it an index — and `every_cause_is_listed` then
+/// fails until that index is actually in the array. Neither half is enough
+/// alone: a wildcard would swallow the variant silently, and an array nobody is
+/// forced to update would simply not mention it.
+#[cfg(test)]
+const fn clock_error_index(error: &ClockError) -> usize {
+    match error {
+        ClockError::OscillatorStopped => 0,
+        ClockError::NotBcd { .. } => 1,
+        ClockError::ReservedBitSet { .. } => 2,
+        ClockError::OutOfRange { .. } => 3,
+        ClockError::TwelveHourMode => 4,
+    }
+}
+
+/// What the person holding the device should do about a clock that cannot be
+/// read.
+///
+/// This exists because **the responses genuinely differ, and a generic failure
+/// message throws that away.** A dead coin cell is a self-service fix with a
+/// part from any supermarket; a floating bus is a fault that needs the device
+/// opened by someone who can find it. Collapsing both to "clock error" hands
+/// the holder a device that is either trivially repairable or not, with no way
+/// to tell which — at the moment they most need to know.
+///
+/// It is deliberately **not** one remedy per [`ClockError`]. Two causes may call
+/// for the same action while remaining different diagnoses, and that asymmetry
+/// is the design: [`ClockError::cause`] is injective and says *what is wrong*,
+/// [`ClockError::remedy`] is many-to-one and says *what to do*. Both travel; the
+/// tests below hold the injectivity that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remedy {
+    /// The cell is dead or was never fitted. Replace it, then set the clock.
+    ReplaceCell,
+
+    /// The part answers and the registers are readable, but hold something this
+    /// firmware did not write. Setting the clock rewrites them, in 24-hour mode
+    /// and with the stop flag acknowledged in the right order.
+    SetClock,
+
+    /// The part is not answering usefully at all. Not fixable in the field.
+    Service,
+}
+
+impl Remedy {
+    /// One line, addressed to whoever is holding the device.
+    pub const fn advice(&self) -> &'static str {
+        match self {
+            Remedy::ReplaceCell => "replace the coin cell, then set the clock",
+            Remedy::SetClock => "set the clock; these registers were not written by this firmware",
+            Remedy::Service => "hardware fault: the clock is absent, unpowered, or miswired",
+        }
+    }
+}
+
+impl ClockError {
+    /// What is wrong, in one line, distinct for every variant.
+    ///
+    /// Distinctness is the property under test. A reading rejected because the
+    /// cell died and a reading rejected because nothing answered on the bus are
+    /// different events with different fixes, and the difference has to survive
+    /// all the way to whatever the holder reads — not be flattened at the first
+    /// boundary it crosses.
+    ///
+    /// The register number is not in here because it is not `&'static`. It is
+    /// in the `Debug` form, which callers print alongside this.
+    pub const fn cause(&self) -> &'static str {
+        match self {
+            ClockError::OscillatorStopped => {
+                "the oscillator stopped since the flag was last cleared; the time registers are stale"
+            }
+            ClockError::NotBcd { .. } => {
+                "a register was not BCD, which is what a floating bus reading 0xFF looks like"
+            }
+            ClockError::ReservedBitSet { .. } => {
+                "a register bit the datasheet fixes at zero was set, so the byte is not a reading"
+            }
+            ClockError::OutOfRange { .. } => {
+                "the registers decoded to an impossible date, such as a 13th month"
+            }
+            ClockError::TwelveHourMode => {
+                "the part is in 12-hour mode, which this firmware never writes"
+            }
+        }
+    }
+
+    /// What to do about it. Many-to-one on purpose — see [`Remedy`].
+    pub const fn remedy(&self) -> Remedy {
+        match self {
+            ClockError::OscillatorStopped => Remedy::ReplaceCell,
+            // Both are the signature of a part that is not there: nothing drives
+            // the bus, the master reads 0xFF, and 0xFF fails as BCD and fails
+            // the reserved bits independently.
+            ClockError::NotBcd { .. } | ClockError::ReservedBitSet { .. } => Remedy::Service,
+            // The part answered and the bytes were well-formed enough to decode,
+            // so the bus is fine and the content is not. Rewriting it is the fix
+            // in both cases, even though they are different diagnoses.
+            ClockError::OutOfRange { .. } | ClockError::TwelveHourMode => Remedy::SetClock,
+        }
+    }
+}
+
 /// A wall-clock instant as the DS3231 stores it: seconds, no zone, no
 /// sub-second part.
 ///
@@ -473,10 +601,29 @@ pub fn decode_time(regs: &[u8; TIME_REGISTER_COUNT]) -> Result<CivilTime, ClockE
 /// and an order that decoded first would let a stale date past on any path that
 /// forgot to look at the flag.
 pub fn read_unix_ms(status: u8, regs: &[u8; TIME_REGISTER_COUNT]) -> Result<u64, ClockError> {
+    Ok(read_civil_time(status, regs)?.unix_ms())
+}
+
+/// [`read_unix_ms`] without the final conversion, for callers that want the
+/// broken-down fields.
+///
+/// The only reason this is separate is display. A device reporting its clock
+/// state to a person needs `2026-08-29T11:24:07Z`, not `1787839509000`, and
+/// building that from Unix milliseconds means writing the civil-from-days
+/// arithmetic a second time in the opposite direction — new code, on the
+/// firmware side of the boundary, where nothing can test it. Handing back the
+/// [`CivilTime`] that was decoded anyway costs nothing and avoids the inverse
+/// entirely.
+///
+/// Checks the stop flag **first**, for the reason [`read_unix_ms`] gives.
+pub fn read_civil_time(
+    status: u8,
+    regs: &[u8; TIME_REGISTER_COUNT],
+) -> Result<CivilTime, ClockError> {
     if oscillator_stopped(status) {
         return Err(ClockError::OscillatorStopped);
     }
-    Ok(decode_time(regs)?.unix_ms())
+    decode_time(regs)
 }
 
 /// Check that the reserved bits are zero, then decode the value bits as BCD.
@@ -609,6 +756,40 @@ pub enum ReadError<E> {
     Clock(ClockError),
 }
 
+impl<E> ReadError<E> {
+    /// What is wrong, in one line.
+    ///
+    /// The whole point of this method is that it does **not** flatten. Firmware
+    /// holding a `ReadError` has a specific diagnosis in hand, and the easy
+    /// thing to write at that boundary is `println!("clock error")` — which
+    /// discards, in one line of otherwise unremarkable code, the distinction
+    /// this module spends three checks establishing. Giving the specific text
+    /// away for free is the cheapest way to make the specific thing also the
+    /// easy thing.
+    ///
+    /// A [`ReadError::Bus`] has no `ClockError` under it, so its text is fixed
+    /// here. Its payload is the HAL's own error type, which is `Debug` on the
+    /// firmware side and printed there alongside this.
+    pub const fn cause(&self) -> &'static str {
+        match self {
+            ReadError::Bus(_) => "the I2C transaction failed; nothing on the bus answered",
+            ReadError::Clock(error) => error.cause(),
+        }
+    }
+
+    /// What to do about it.
+    ///
+    /// A bus failure is [`Remedy::Service`] for the same reason
+    /// [`ClockError::NotBcd`] is: both mean the part is not there in any useful
+    /// sense, and neither is fixable with a coin cell.
+    pub const fn remedy(&self) -> Remedy {
+        match self {
+            ReadError::Bus(_) => Remedy::Service,
+            ReadError::Clock(error) => error.remedy(),
+        }
+    }
+}
+
 /// The whole read: status, then the time registers, then Unix milliseconds.
 ///
 /// The order is the reason this lives here rather than in the driver. The stop
@@ -623,6 +804,13 @@ pub enum ReadError<E> {
 /// reads are not what the ban is about — but not reading them at all is one
 /// less place a future refactor can find a use for the bytes.
 pub fn read_clock<B: RegisterBus>(bus: &mut B) -> Result<u64, ReadError<B::Error>> {
+    read_clock_civil(bus).map(|time| time.unix_ms())
+}
+
+/// [`read_clock`] returning the broken-down fields, for reporting the clock's
+/// state to a person. Same two transactions, same ordering rule; see
+/// [`read_civil_time`] for why the undecoded form is worth having.
+pub fn read_clock_civil<B: RegisterBus>(bus: &mut B) -> Result<CivilTime, ReadError<B::Error>> {
     let mut status = [0u8; 1];
     bus.read(REG_STATUS, &mut status).map_err(ReadError::Bus)?;
 
@@ -630,7 +818,7 @@ pub fn read_clock<B: RegisterBus>(bus: &mut B) -> Result<u64, ReadError<B::Error
     bus.read(REG_SECONDS, &mut registers)
         .map_err(ReadError::Bus)?;
 
-    read_unix_ms(status[0], &registers).map_err(ReadError::Clock)
+    read_civil_time(status[0], &registers).map_err(ReadError::Clock)
 }
 
 /// Set the clock and then acknowledge the stop flag, in that order.
@@ -1246,5 +1434,153 @@ mod tests {
         let mut settled = MockBus::holding(written, bus.writes[1].1[0]);
 
         assert_eq!(read_clock(&mut settled), Ok(time.unix_ms()));
+    }
+
+    /// The two entry points must not drift. `read_clock` is defined in terms of
+    /// `read_clock_civil`, so this is cheap today; it is here to fail if someone
+    /// ever re-implements one of them independently.
+    #[test]
+    fn both_reads_report_the_same_instant() {
+        let mut a = MockBus::holding(KNOWN_REGS, 0x00);
+        let mut b = MockBus::holding(KNOWN_REGS, 0x00);
+
+        assert_eq!(read_clock(&mut a).unwrap(), KNOWN_UNIX_MS);
+        assert_eq!(read_clock_civil(&mut b).unwrap().unix_ms(), KNOWN_UNIX_MS);
+    }
+
+    /// The broken-down read enforces the stop flag exactly as the other one
+    /// does. Asserted separately because it is a second door into the same
+    /// registers, and a second door is where a check gets left off.
+    #[test]
+    fn the_broken_down_read_refuses_a_stopped_oscillator_too() {
+        let mut bus = MockBus::holding(KNOWN_REGS, OSCILLATOR_STOP_FLAG);
+        assert_eq!(
+            read_clock_civil(&mut bus),
+            Err(ReadError::Clock(ClockError::OscillatorStopped)),
+        );
+    }
+
+    // ---- The cause must survive the trip to whoever is holding the device ----
+    //
+    // These are the executable half of a rule that is otherwise a doc comment:
+    // a reading rejected because the cell died and one rejected because nothing
+    // answered on the bus are different events with different fixes, and the
+    // difference has to reach the display intact. The failure mode being
+    // guarded is not a wrong message, it is a *generic* one — and a generic
+    // message is invisible, because it is still true.
+
+    /// No two causes read the same. Copy-pasting an arm of `cause` is the
+    /// specific, ordinary way this degrades.
+    #[test]
+    fn causes_are_pairwise_distinct() {
+        for (i, a) in ALL_CLOCK_ERRORS.iter().enumerate() {
+            for b in &ALL_CLOCK_ERRORS[i + 1..] {
+                assert_ne!(
+                    a.cause(),
+                    b.cause(),
+                    "{a:?} and {b:?} tell the holder the same thing",
+                );
+            }
+        }
+    }
+
+    /// `ALL_CLOCK_ERRORS` accounts for every variant exactly once.
+    ///
+    /// Same shape as `every_register_is_classified`: the array is only evidence
+    /// if it is a partition. `clock_error_index` is exhaustive, so a new variant
+    /// cannot compile without an index, and this then fails until the index is
+    /// occupied — which is what stops a variant being added with no cause of its
+    /// own and nothing noticing.
+    #[test]
+    fn every_cause_is_listed() {
+        let mut seen = [false; ALL_CLOCK_ERRORS.len()];
+        for error in &ALL_CLOCK_ERRORS {
+            let index = clock_error_index(error);
+            assert!(!seen[index], "{error:?} appears twice");
+            seen[index] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "a ClockError variant has an index but is not in ALL_CLOCK_ERRORS",
+        );
+    }
+
+    /// Every cause names an action, and no cause is silently unhandled.
+    #[test]
+    fn every_cause_carries_an_action() {
+        for error in &ALL_CLOCK_ERRORS {
+            assert!(!error.cause().is_empty(), "{error:?} has no cause text");
+            assert!(
+                !error.remedy().advice().is_empty(),
+                "{error:?} has no advice",
+            );
+        }
+    }
+
+    /// Every remedy is reachable from some cause.
+    ///
+    /// The interesting direction is the one this catches going stale: a remedy
+    /// that no longer applies to anything is a branch the display can never
+    /// show, and it means a cause was quietly re-pointed somewhere else.
+    #[test]
+    fn every_remedy_is_reachable() {
+        for remedy in [Remedy::ReplaceCell, Remedy::SetClock, Remedy::Service] {
+            assert!(
+                ALL_CLOCK_ERRORS.iter().any(|e| e.remedy() == remedy),
+                "{remedy:?} is advice nothing can produce",
+            );
+        }
+    }
+
+    /// The distinction the holder actually acts on: a dead cell is a trip to a
+    /// supermarket, a dead bus is a trip to whoever can open the case. If these
+    /// ever agree, the device has stopped telling anyone which one they have.
+    #[test]
+    fn a_dead_cell_and_a_dead_bus_do_not_advise_the_same_thing() {
+        assert_ne!(
+            ClockError::OscillatorStopped.remedy(),
+            ClockError::NotBcd { register: 0x00 }.remedy(),
+        );
+        assert_eq!(ClockError::OscillatorStopped.remedy(), Remedy::ReplaceCell);
+    }
+
+    /// A bus failure is its own diagnosis, not borrowed from a decode failure.
+    #[test]
+    fn a_bus_failure_reads_as_a_bus_failure() {
+        let bus_error: ReadError<()> = ReadError::Bus(());
+        for error in &ALL_CLOCK_ERRORS {
+            assert_ne!(
+                bus_error.cause(),
+                error.cause(),
+                "a bus failure is being reported as {error:?}",
+            );
+        }
+    }
+
+    /// The crossing itself: what firmware ends up holding after a failed read
+    /// still carries the specific cause, not a flag saying something went wrong.
+    ///
+    /// This is the test that would fail if `read_clock_civil` were ever
+    /// simplified to return `Option<CivilTime>` — which is exactly the shape
+    /// that makes the generic message unavoidable downstream.
+    #[test]
+    fn a_failed_read_hands_firmware_the_specific_cause() {
+        // A part that is not there: the master reads 0xFF on every line.
+        let mut absent = MockBus::holding([0xFF; TIME_REGISTER_COUNT], 0x00);
+        let error = read_clock_civil(&mut absent).unwrap_err();
+
+        assert_eq!(error.remedy(), Remedy::Service);
+        assert_ne!(
+            error.cause(),
+            ClockError::OscillatorStopped.cause(),
+            "an absent part must not be reported as a dead cell",
+        );
+
+        // A cell that died: the registers are perfectly well-formed and stale.
+        let mut stale = MockBus::holding(KNOWN_REGS, OSCILLATOR_STOP_FLAG);
+        let error = read_clock_civil(&mut stale).unwrap_err();
+
+        assert_eq!(error.remedy(), Remedy::ReplaceCell);
+        assert_eq!(error.cause(), ClockError::OscillatorStopped.cause());
     }
 }

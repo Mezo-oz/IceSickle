@@ -107,6 +107,22 @@ code that appears to address it.
 So any fix is two changes, not one: **persist the state, and move the time base
 to a clock that survives the reset.**
 
+**"Move the time base" is narrower than it sounds, and reading it broadly breaks
+the device.** The firmware wiring turned this up while implementing it. The
+DS3231 counts whole seconds; the debounce window is 50 ms and the cooldown is
+1000 ms. A debounce driven off the clock sees one instant across twenty
+consecutive polls, so every press either passes unfiltered or never resolves,
+and a cooldown read from it quantizes to somewhere between 0 and 1000 ms
+depending where in the second the press landed. Neither failure prints
+anything — the same shape as the bug this section is about.
+
+So the firmware now carries **two** time bases, and the fix here needs one of
+each: `uptime_ms()` for what happens inside a boot, wall-clock for the part that
+crosses the sleep boundary. What persists is a wall-clock instant; what the
+debounce runs on does not change. `firmware/nostd/src/bin/main.rs` states the
+split at the top, because a later reader coming from this paragraph is exactly
+who would collapse it back.
+
 ### Two stores
 
 **1. RTC-backed memory.** The ESP32-S3 keeps an RTC domain powered through deep
@@ -138,29 +154,39 @@ model already concedes. Both require the same physical access. Option 1 closes
 the accidental case (a device that sleeps normally) without adding a component,
 and the deliberate case was never closed by either option.
 
-### An external RTC is not in this repo, and would change more than the cooldown
+### An external RTC would change more than the cooldown — RESOLVED by D13
 
-Flagged because it was proposed as already present: **there is no DS3231, no I2C,
-no coin cell, and no external clock anywhere in this repository** — no
-dependency, no driver, no mention in any document. If one is planned, it lives in
-the `.docx` narrative documents this file's siblings still need reconciling with.
+**This subsection is kept for its argument, not its facts. Its opening claim is
+now false and its demand has been met.** It was written when the DS3231 appeared
+only in the narrative documents, and it said: there is no DS3231, no I2C, no coin
+cell and no external clock anywhere in this repository. All four now exist — D13,
+`crates/icesickle-core/src/clock.rs`, `firmware/nostd/src/clock.rs`, and the
+wiring in `main.rs`.
 
-That matters well beyond this item, because the device having no trusted clock is
-a load-bearing premise in decisions that are already merged:
+What it got right is why it is still here. It argued that a clock could not be
+adopted sideways as an implementation detail of a rate limit, because the device
+having no *trusted* clock is a load-bearing premise in merged decisions:
 
-- `VERIFIER_MODEL.md` §1 states plainly that `timestamp_ms` is milliseconds since
-  boot, meaningless across a power cycle and meaningless to a third party because
+- `VERIFIER_MODEL.md` §1 defined `timestamp_ms` as milliseconds since boot,
+  meaningless across a power cycle and meaningless to a third party because
   nothing anchors what "boot" was.
 - §3.2's preloaded beacon and §3.3's ingest co-signature exist **specifically
   because** the device cannot be trusted to say what time it is. A real clock
-  would not make them redundant — the device could still lie — but it would
-  change the argument for why they are shaped as they are.
+  does not make them redundant — the device can still lie — but it changes the
+  argument for why they are shaped as they are.
 - D10 leans on the same asymmetry when it gives verifiers a clock for certificate
   expiry and denies the device one.
 
-So if a battery-backed RTC is genuinely in the hardware plan, **it should be
-recorded as a decision in its own right and those sections revisited** — not
-adopted sideways as an implementation detail of a rate limit.
+So it demanded a decision of its own with those sections revisited. **That is
+exactly what D13 is**, and it separated the two claims the objection was really
+about: the device *has* a clock (hardware fact), and the device's clock is *not
+trusted for verification* (security claim). §3.2 and §3.3 are reaffirmed rather
+than redundant, and `timestamp_ms` became Unix milliseconds — which is what the
+firmware wiring below finally makes true in code.
+
+`VERIFIER_MODEL.md` §1 was revised with D13 and already reads in the past tense —
+`timestamp_ms` *was* milliseconds since boot — so the code is now the last piece
+to catch up, and it has.
 
 ### Already handled
 
@@ -169,7 +195,7 @@ an always-on duty cycle and destroying the power budget. The Brief 3 scaffold
 reads the pin before consuming it as a wake source and warns. No further action
 unless bench testing shows the warning is insufficient.
 
-## The DS3231: codec and transport done, wiring next
+## The DS3231: codec, transport and wiring done
 
 D13 confirmed the clock as intended hardware and left "no I2C driver exists" as
 real work. It exists now.
@@ -196,23 +222,75 @@ holds them where nothing can check them, since `firmware/nostd` can host no
 tests at all. A mock bus now covers both on stable. That was worth more than the
 register ban the trait was designed around.
 
-**Not done, in order:**
+**Also done: the wiring.** `main.rs` reads the DS3231 and `timestamp_ms` is Unix
+milliseconds, so the contradiction this section used to record — docs specifying
+wall-clock time against code printing `"ms since boot"` — is closed, and §6 step
+8 is implementable. The two questions the wiring had to answer, answered:
 
-1. **Wiring it into the firmware.** `firmware/nostd/src/bin/main.rs:62` still
-   defines `now_ms()` as `Instant::now()`, and line 156 still prints
-   `"ms since boot"`. Until that changes the firmware cannot produce the Unix
-   `timestamp_ms` that D13 made mandatory and that `TOKEN_PROTOCOL.md` §5,
-   `VERIFIER_MODEL.md` §1 and `AttestationPayload` already document — **the
-   docs and the code currently disagree on main, and the §6 step 8 arrival
-   check is unimplementable until they stop.**
+- **Absent clock, or dead cell: the device stays alive and refuses to attest,
+  naming the specific cause.** There is no honest fallback. Substituting uptime
+  emits the right type and the wrong quantity, indistinguishable downstream from
+  a real timestamp — the exact failure the codec spends three checks refusing to
+  make. Refusing is only half of it, though: **which** failure it was decides
+  what the holder does, since a dead coin cell is a supermarket part and a
+  floating bus is not a field repair. So `ClockError::cause`/`remedy` and the
+  same pair on `ReadError` carry the diagnosis to the console instead of letting
+  it flatten to "clock error" at the crate boundary — the same degrade-at-a-seam
+  shape as the `RegisterWrite` ban, and held by host tests rather than by
+  intent: causes pairwise distinct, every variant accounted for by a partition
+  test, every remedy reachable, a dead cell and a dead bus never advising the
+  same thing.
+- **SDA=GPIO8, SCL=GPIO9 — the conventional S3 pairing, and still a guess.** See
+  the gate below; this is the one thing in the wiring that is not settled.
 
-   Two things the wiring has to answer that the transport did not: which GPIOs
-   carry SDA and SCL (a board fact, currently written down nowhere), and what a
-   device does when the clock is absent or its cell is dead. The second is not a
-   detail — **QEMU models no DS3231**, so whatever the firmware does on a failed
-   read is what the emulator job will exercise on every run.
-2. **Cooldown persistence**, below, which needs a time base that survives the
+Two things found while doing it, both recorded where they bite: the clock cannot
+be the debounce time base (see the cooldown section above), and the clock is read
+*before* the cooldown is gated, because `gate` records on success and gating
+first would answer every press on a dead-cell device with a true, useless
+"cooldown: 900 ms remaining" instead of the fault.
+
+**QEMU still models no DS3231**, so the emulator job exercises the refusal path
+by construction — which is the argument for the refusal being loud and specific
+rather than a halt. It costs nothing today: `esp_hal::init()` does not return
+under QEMU, so nothing downstream of it runs at all.
+
+### Gate: confirm the I2C pins before anything touches real hardware
+
+**Blocks hardware bring-up. Blocks nothing else** — every host test, the
+emulator job and the cooldown work below are unaffected, because none of them
+reach a physical bus.
+
+`SDA_PIN`/`SCL_PIN` in `main.rs` are Espressif's conventional S3 pairing, which
+is a good guess and not a schematic. Nothing in this repository is the
+schematic, so this cannot be closed from inside it.
+
+It is on the roadmap as a gate rather than a task because of what a wrong guess
+produces: **no answer on the bus, reported correctly as a hardware fault, on a
+device whose hardware is fine.** That is the least diagnosable failure this
+firmware has — the report is accurate, the advice ("hardware fault: the clock is
+absent, unpowered, or miswired") is reasonable, and it points away from the
+actual cause. Somebody would replace a working DS3231 before suspecting the
+constant.
+
+So the assumption is made to announce itself rather than sit in a comment:
+
+- The device **prints it at every boot**, before the first clock read, so it is
+  on screen whether or not the read succeeds.
+- `TODO(pins)` makes it greppable.
+- A CI step in the `firmware-nostd` job fails the build if the marker is present
+  while the boot line is gone, so it cannot quietly stop announcing itself.
+  Removing all three in one change is what confirming the pins looks like.
+
+**To close:** read the schematic, correct the two constants and the two
+`peripherals.GPIOn` arguments together, delete `PINS_UNCONFIRMED`, its boot line
+and the `TODO(pins)` marker.
+
+**Not done:**
+
+1. **Cooldown persistence**, above, which needs a time base that survives the
    reset and now has one.
+2. **Everything in `NOSTD_ENTROPY_SPIKE.md`'s Status list that needs silicon**,
+   which the pin gate above is now the first item of.
 
 **A rule the hardware does not enforce, so the code does.** D13 says the clock
 stores time and nothing else. It is tempting to treat that as closed by the part

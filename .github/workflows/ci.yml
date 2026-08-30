@@ -3,8 +3,23 @@ name: CI
 on:
   push:
     branches: [main]
+  # `main` plus stacked branches.
+  #
+  # A PR based on another feature branch used to run nothing at all: the branch
+  # filter matches the PR's *base*, so a PR targeting `feat/...` fell through
+  # and only third-party checks reported.
+  #
+  # That gap is worst for exactly the work least verifiable elsewhere. The host
+  # crates build on stable and can be checked locally in seconds; the firmware
+  # needs the Xtensa toolchain, so for anyone without it this workflow is the
+  # only thing that ever compiles `firmware/nostd` -- and a stacked PR was
+  # therefore the one shape of change that could sit for days looking reviewed
+  # while never having been built. Reading an API is not compiling against it.
+  #
+  # The alternative was to rebase every stack onto `main` for CI, which trades a
+  # reviewable diff for a build. There is no reason to pay that.
   pull_request:
-    branches: [main]
+    branches: [main, "feat/**", "design/**", "docs/**", "test/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,6 +118,44 @@ jobs:
       - name: Clippy
         working-directory: firmware/nostd
         run: cargo clippy --lib --bins --locked -- -D warnings
+
+      # Provisional board facts must announce themselves at runtime, not only in
+      # a comment.
+      #
+      # The pin assignment is a guess until someone reads the schematic, and the
+      # failure a wrong guess produces is the least diagnosable one this firmware
+      # has: no answer on the bus, reported correctly as a hardware fault, on a
+      # device whose hardware is fine. So the firmware says it out loud at every
+      # boot, in front of whoever powers on the first unit.
+      #
+      # Not asserted against the emulator's serial log, which would be the
+      # stronger check: esp_hal::init() does not return under QEMU, so nothing
+      # after it prints and the line would never appear. That is a limit of the
+      # emulator, not of the claim -- it is why this step checks the source
+      # instead of the output.
+      #
+      # This step exists because those two things can drift apart in the
+      # direction that matters: deleting the boot line while the TODO stands
+      # leaves an assumption that has stopped announcing itself, and nothing
+      # would otherwise notice. The reverse -- both removed together -- is
+      # exactly what confirming the pins looks like, and passes.
+      #
+      # Added to this job rather than as a new one on purpose. A new required
+      # check has to be added to branch protection in the same change or it
+      # never reports and blocks every later PR on a check that cannot run,
+      # which issue #24 flagged while weighing the same idiom.
+      - name: Provisional board facts are announced at boot
+        run: |
+          if grep -rn "TODO(pins)" firmware/ ; then
+            echo "Pin assignment is still marked provisional; checking it is announced..."
+            grep -q "^const PINS_UNCONFIRMED" firmware/nostd/src/bin/main.rs \
+              || { echo "::error::TODO(pins) is present but PINS_UNCONFIRMED is gone. An unconfirmed pin assignment must announce itself at boot -- see the constant's docs. Remove both together when the schematic is checked, or neither."; exit 1; }
+            grep -q 'println!("{PINS_UNCONFIRMED}' firmware/nostd/src/bin/main.rs \
+              || { echo "::error::PINS_UNCONFIRMED exists but nothing prints it. The constant is only worth having because the device says it at every boot."; exit 1; }
+            echo "provisional pins are announced at boot"
+          else
+            echo "no provisional pin markers; nothing to enforce"
+          fi
 
   # The host workspace: icesickle-core and the verify-attestation tool.
   #
