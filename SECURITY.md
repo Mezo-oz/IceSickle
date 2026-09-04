@@ -5,7 +5,7 @@
 If you discover a security vulnerability in IceSickle, please report it responsibly:
 
 1. **Do not** open a public GitHub issue
-2. Email details to: [YOUR_EMAIL_HERE]
+2. Email details to: mezoozpress@gmail.com
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
