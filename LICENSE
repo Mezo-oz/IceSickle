@@ -48,11 +48,7 @@
       "Contribution" shall mean any work of authorship, including
       the original version of the Work and any modifications or additions
       to that Work or Derivative Works thereof, that is intentionally
-<<<<<<< HEAD
-      submitted to the Licensor for inclusion in the Work by the copyright owner
-=======
       submitted to Licensor for inclusion in the Work by the copyright owner
->>>>>>> 51536d4854db84716dca7190e3888f3857a5bf6f
       or by an individual or Legal Entity authorized to submit on behalf of
       the copyright owner. For the purposes of this definition, "submitted"
       means any form of electronic, verbal, or written communication sent
@@ -178,8 +174,6 @@
       of your accepting any such warranty or additional liability.
 
    END OF TERMS AND CONDITIONS
-<<<<<<< HEAD
-=======
 
    APPENDIX: How to apply the Apache License to your work.
 
@@ -205,4 +199,3 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
->>>>>>> 51536d4854db84716dca7190e3888f3857a5bf6f
