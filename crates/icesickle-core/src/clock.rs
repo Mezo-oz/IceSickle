@@ -6,10 +6,11 @@
 //! half — the reason nobody may believe the answer — lives in
 //! `docs/DECISIONS_V2_1.md` D13 and `docs/VERIFIER_MODEL.md` §3.
 //!
-//! No hardware here, and no clock of its own. The firmware reads the registers
-//! and passes them in, exactly as it passes `now_ms` to [`crate::cooldown`] and
-//! a seed to [`crate::Attestation::create`]. That is what makes a chip we do not
-//! own testable on a host that does not have one.
+//! No hardware here, and no clock of its own. The firmware supplies a
+//! [`RegisterBus`] that forwards bytes over I2C, exactly as it passes `now_ms` to
+//! [`crate::cooldown`] and a seed to [`crate::Attestation::create`]; this module
+//! decides what to read, in what order, and what the bytes mean. That is what
+//! makes a chip we do not own testable on a host that does not have one.
 //!
 //! # What this module is actually defending against
 //!
