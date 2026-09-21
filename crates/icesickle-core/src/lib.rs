@@ -7,10 +7,11 @@
 //! Every reading a decision depends on arrives as a parameter.
 //!
 //! [`clock`] is not the exception it looks like. It decodes the bytes of a
-//! real-time clock without ever reading one: the firmware does the I2C
-//! transaction and passes the registers in, the same way it passes `now_ms` to
-//! [`cooldown`]. Keeping the seam there is what makes a part nobody here owns
-//! testable on a host that does not have one.
+//! real-time clock and owns the order it is read in, but never touches a bus:
+//! the firmware supplies a [`clock::RegisterBus`] that forwards bytes, the same
+//! way it passes `now_ms` to [`cooldown`]. Keeping the seam there is what makes
+//! a part nobody here owns testable on a host that does not have one — a mock
+//! bus stands in for the chip.
 //!
 //! [`auth`] is the exception: no code at all, only the constraint that keeps
 //! device identity out of this project. Read it before adding anything that
@@ -22,7 +23,7 @@
 //! clock — and both are **parameters**, supplied by the caller.
 //!
 //! That is the whole point of this crate. The firmware fills the seed from a
-//! [`Trng`]-backed source and the timestamp from a hardware timer; a host test
+//! [`Trng`]-backed source and the timestamp from the DS3231 (D13); a host test
 //! passes fixed bytes and asserts exact signature output. The signing path is
 //! therefore fully covered on any machine, with no ESP32 and no emulator —
 //! which matters because Espressif's QEMU cannot reach this code at all
